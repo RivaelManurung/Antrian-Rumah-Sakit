@@ -3,13 +3,17 @@
 namespace App\Http\Controllers\Queue;
 
 use App\Http\Controllers\Controller;
+use App\Services\QueueActionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\ValidationException;
 
 class QueueActionController extends Controller
 {
+    public function __construct(private readonly QueueActionService $queueActionService)
+    {
+    }
+
     public function callNext(Request $request): JsonResponse
     {
         $data = $request->validate([
@@ -17,58 +21,11 @@ class QueueActionController extends Controller
             'queue_date' => ['nullable', 'date'],
         ]);
 
-        $queue = DB::transaction(function () use ($request, $data) {
-            $queueDate = $data['queue_date'] ?? now()->toDateString();
-            $roomId = (int) $data['room_id'];
-            $performedBy = $request->user()?->id;
-
-            $existingServing = DB::table('queues')
-                ->whereDate('queue_date', $queueDate)
-                ->where('room_id', $roomId)
-                ->where('status', 'serving')
-                ->lockForUpdate()
-                ->first();
-
-            if ($existingServing) {
-                throw ValidationException::withMessages([
-                    'room_id' => ['Masih ada antrian yang sedang dilayani. Selesaikan dulu sebelum memanggil berikutnya.'],
-                ]);
-            }
-
-            $nextQueue = DB::table('queues')
-                ->whereDate('queue_date', $queueDate)
-                ->where('room_id', $roomId)
-                ->where('status', 'waiting')
-                ->orderBy('number')
-                ->lockForUpdate()
-                ->first();
-
-            if (! $nextQueue) {
-                throw ValidationException::withMessages([
-                    'queue' => ['Tidak ada antrian waiting untuk dipanggil.'],
-                ]);
-            }
-
-            DB::table('queues')->where('id', $nextQueue->id)->update([
-                'status' => 'serving',
-                'called_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            DB::table('queue_counters')->updateOrInsert(
-                ['room_id' => $roomId],
-                [
-                    'current_queue_id' => $nextQueue->id,
-                    'last_called_at' => now(),
-                    'updated_at' => now(),
-                    'created_at' => now(),
-                ]
-            );
-
-            $this->writeLog($nextQueue->id, 'called', $performedBy, 'Panggil antrian berikutnya');
-
-            return DB::table('queues')->find($nextQueue->id);
-        });
+        $queue = $this->queueActionService->callNext(
+            (int) $data['room_id'],
+            $data['queue_date'] ?? null,
+            $request->user()?->id
+        );
 
         return response()->json([
             'message' => 'Antrian berikutnya berhasil dipanggil.',
@@ -78,124 +35,57 @@ class QueueActionController extends Controller
 
     public function recall(Request $request, int $queueId): JsonResponse
     {
-        $queue = DB::table('queues')->where('id', $queueId)->first();
+        $queue = $this->queueActionService->recall($queueId, $request->user()?->id);
 
         if (! $queue) {
             return response()->json(['message' => 'Antrian tidak ditemukan.'], 404);
         }
 
-        if (! in_array($queue->status, ['serving', 'waiting'], true)) {
-            return response()->json(['message' => 'Hanya antrian waiting/serving yang dapat dipanggil ulang.'], 422);
-        }
-
-        DB::transaction(function () use ($request, $queue) {
-            DB::table('queues')->where('id', $queue->id)->update([
-                'status' => 'serving',
-                'called_at' => now(),
-                'updated_at' => now(),
-            ]);
-
-            DB::table('queue_counters')->updateOrInsert(
-                ['room_id' => $queue->room_id],
-                [
-                    'current_queue_id' => $queue->id,
-                    'last_called_at' => now(),
-                    'updated_at' => now(),
-                    'created_at' => now(),
-                ]
-            );
-
-            $this->writeLog($queue->id, 'recalled', $request->user()?->id, 'Panggil ulang antrian');
-        });
-
         return response()->json([
             'message' => 'Antrian berhasil dipanggil ulang.',
-            'data' => DB::table('queues')->find($queue->id),
+            'data' => $queue,
         ]);
     }
 
     public function skip(Request $request, int $queueId): JsonResponse
     {
-        return $this->transitionToFinalState(
-            $request,
-            $queueId,
-            'skipped',
-            'skipped',
-            'Antrian berhasil di-skip.'
-        );
-    }
-
-    public function done(Request $request, int $queueId): JsonResponse
-    {
-        return $this->transitionToFinalState(
-            $request,
-            $queueId,
-            'done',
-            'done',
-            'Antrian berhasil diselesaikan.'
-        );
-    }
-
-    public function cancel(Request $request, int $queueId): JsonResponse
-    {
-        return $this->transitionToFinalState(
-            $request,
-            $queueId,
-            'cancelled',
-            'cancelled',
-            'Antrian berhasil dibatalkan.'
-        );
-    }
-
-    private function transitionToFinalState(
-        Request $request,
-        int $queueId,
-        string $targetStatus,
-        string $logAction,
-        string $message
-    ): JsonResponse {
-        $queue = DB::table('queues')->where('id', $queueId)->first();
+        $queue = $this->queueActionService->skip($queueId, $request->user()?->id);
 
         if (! $queue) {
             return response()->json(['message' => 'Antrian tidak ditemukan.'], 404);
         }
 
-        if (in_array($queue->status, ['done', 'cancelled'], true)) {
-            return response()->json(['message' => 'Antrian sudah final dan tidak dapat diubah.'], 422);
-        }
-
-        DB::transaction(function () use ($request, $queue, $targetStatus, $logAction) {
-            DB::table('queues')->where('id', $queue->id)->update([
-                'status' => $targetStatus,
-                'finished_at' => in_array($targetStatus, ['done', 'cancelled'], true) ? now() : null,
-                'updated_at' => now(),
-            ]);
-
-            DB::table('queue_counters')
-                ->where('room_id', $queue->room_id)
-                ->where('current_queue_id', $queue->id)
-                ->update([
-                    'current_queue_id' => null,
-                    'updated_at' => now(),
-                ]);
-
-            $this->writeLog($queue->id, $logAction, $request->user()?->id, null);
-        });
-
         return response()->json([
-            'message' => $message,
-            'data' => DB::table('queues')->find($queueId),
+            'message' => 'Antrian berhasil di-skip.',
+            'data' => $queue,
         ]);
     }
 
-    private function writeLog(int $queueId, string $action, ?int $performedBy, ?string $note): void
+    public function done(Request $request, int $queueId): JsonResponse
     {
-        DB::table('queue_logs')->insert([
-            'queue_id' => $queueId,
-            'action' => $action,
-            'performed_by' => $performedBy,
-            'note' => $note,
-            'created_at' => now(),
+        $queue = $this->queueActionService->done($queueId, $request->user()?->id);
+
+        if (! $queue) {
+            return response()->json(['message' => 'Antrian tidak ditemukan.'], 404);
+        }
+
+        return response()->json([
+            'message' => 'Antrian berhasil diselesaikan.',
+            'data' => $queue,
+        ]);
+    }
+
+    public function cancel(Request $request, int $queueId): JsonResponse
+    {
+        $queue = $this->queueActionService->cancel($queueId, $request->user()?->id);
+
+        if (! $queue) {
+            return response()->json(['message' => 'Antrian tidak ditemukan.'], 404);
+        }
+
+        return response()->json([
+            'message' => 'Antrian berhasil dibatalkan.',
+            'data' => $queue,
         ]);
     }
 }

@@ -3,12 +3,17 @@
 namespace App\Http\Controllers\Queue;
 
 use App\Http\Controllers\Controller;
+use App\Services\QueueCounterService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
 class QueueCounterController extends Controller
 {
+    public function __construct(private readonly QueueCounterService $queueCounterService)
+    {
+    }
+
     public function index(): JsonResponse
     {
         $rows = DB::table('queue_counters')
@@ -51,45 +56,21 @@ class QueueCounterController extends Controller
 
     public function sync(Request $request, int $roomId): JsonResponse
     {
-        $queueDate = $request->query('queue_date', now()->toDateString());
-
-        $currentServing = DB::table('queues')
-            ->whereDate('queue_date', $queueDate)
-            ->where('room_id', $roomId)
-            ->where('status', 'serving')
-            ->orderByDesc('updated_at')
-            ->first();
-
-        DB::table('queue_counters')->updateOrInsert(
-            ['room_id' => $roomId],
-            [
-                'current_queue_id' => $currentServing?->id,
-                'last_called_at' => $currentServing?->called_at,
-                'updated_at' => now(),
-                'created_at' => now(),
-            ]
-        );
+        $counter = $this->queueCounterService->sync($roomId, (string) $request->query('queue_date', now()->toDateString()));
 
         return response()->json([
             'message' => 'Counter berhasil disinkronkan.',
-            'data' => DB::table('queue_counters')->where('room_id', $roomId)->first(),
+            'data' => $counter,
         ]);
     }
 
     public function reset(int $roomId): JsonResponse
     {
-        DB::table('queue_counters')->updateOrInsert(
-            ['room_id' => $roomId],
-            [
-                'current_queue_id' => null,
-                'updated_at' => now(),
-                'created_at' => now(),
-            ]
-        );
+        $counter = $this->queueCounterService->reset($roomId);
 
         return response()->json([
             'message' => 'Counter berhasil direset.',
-            'data' => DB::table('queue_counters')->where('room_id', $roomId)->first(),
+            'data' => $counter,
         ]);
     }
 }
